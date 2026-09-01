@@ -34,6 +34,7 @@
 #include <TROOT.h>
 
 #include <tbb/parallel_pipeline.h>
+#include <tbb/task_arena.h>
 
 #include <algorithm>
 #include <atomic>
@@ -544,34 +545,43 @@ retType OverlayTiming::operator()(const edm4hep::EventHeaderCollection& headers,
     };
     std::atomic<size_t> nextRead{0};
     const auto ntokens = static_cast<size_t>(m_overlayThreads.value());
-    tbb::parallel_pipeline(
-        ntokens, tbb::make_filter<void, std::shared_ptr<Item>>(tbb::filter_mode::serial_in_order,
-                                                               [&](tbb::flow_control& fc) -> std::shared_ptr<Item> {
-                                                                 const size_t idx = nextRead++;
-                                                                 if (idx >= reads.size()) {
-                                                                   fc.stop();
-                                                                   return {};
-                                                                 }
-                                                                 return std::make_shared<Item>(Item{&reads[idx], {}});
-                                                               }) &
-                     tbb::make_filter<std::shared_ptr<Item>, std::shared_ptr<Item>>(
-                         tbb::filter_mode::parallel,
-                         [&](const std::shared_ptr<Item>& item) -> std::shared_ptr<Item> {
-                           const auto& r = *item->read;
-                           item->frame = m_bkgEvents->readAt(r.group, r.fileIndex, r.entry);
-                           // Force decompression/materialization here (in parallel) so the
-                           // serial merge only touches already in-memory data.
-                           for (const auto& name : item->frame.getAvailableCollections()) {
-                             item->frame.get(name);
-                           }
-                           return item;
-                         }) &
-                     tbb::make_filter<std::shared_ptr<Item>, void>(
-                         tbb::filter_mode::serial_in_order, [&](const std::shared_ptr<Item>& item) {
-                           const auto& r = *item->read;
-                           mergeBackgroundFrame(item->frame, r.timeOffset, r.bxNumber, r.physBX, simTrackerHits,
-                                                simCaloHits, oparticles, osimTrackerHits, cellIDsMap, ocaloHitContribs);
-                         }));
+    // Run the pipeline in an isolated region. This is defensive: while this thread
+    // waits here TBB is otherwise free to steal another algorithm's task from the
+    // scheduler's arena, and Gaudi's AlgTask overwrites the thread-local
+    // EventContext and whiteboard partition without restoring them, so in principle
+    // we could resume on the wrong event slot. It has not been observed in practice,
+    // but isolating costs nothing.
+    tbb::this_task_arena::isolate([&] {
+      tbb::parallel_pipeline(
+          ntokens, tbb::make_filter<void, std::shared_ptr<Item>>(tbb::filter_mode::serial_in_order,
+                                                                 [&](tbb::flow_control& fc) -> std::shared_ptr<Item> {
+                                                                   const size_t idx = nextRead++;
+                                                                   if (idx >= reads.size()) {
+                                                                     fc.stop();
+                                                                     return {};
+                                                                   }
+                                                                   return std::make_shared<Item>(Item{&reads[idx], {}});
+                                                                 }) &
+                       tbb::make_filter<std::shared_ptr<Item>, std::shared_ptr<Item>>(
+                           tbb::filter_mode::parallel,
+                           [&](const std::shared_ptr<Item>& item) -> std::shared_ptr<Item> {
+                             const auto& r = *item->read;
+                             item->frame = m_bkgEvents->readAt(r.group, r.fileIndex, r.entry);
+                             // Force decompression/materialization here (in parallel) so the
+                             // serial merge only touches already in-memory data.
+                             for (const auto& name : item->frame.getAvailableCollections()) {
+                               item->frame.get(name);
+                             }
+                             return item;
+                           }) &
+                       tbb::make_filter<std::shared_ptr<Item>, void>(
+                           tbb::filter_mode::serial_in_order, [&](const std::shared_ptr<Item>& item) {
+                             const auto& r = *item->read;
+                             mergeBackgroundFrame(item->frame, r.timeOffset, r.bxNumber, r.physBX, simTrackerHits,
+                                                  simCaloHits, oparticles, osimTrackerHits, cellIDsMap,
+                                                  ocaloHitContribs);
+                           }));
+    });
   }
   // Move the SimCalorimeterHitCollections to the output vector
   // So far they are stored in a map with the cellID as key

@@ -128,9 +128,32 @@ which bunch crossing) is drawn up front, and the merging of the background hits
 into the output collections is always done serially and in the same order, so
 the result is **identical and deterministic** regardless of `OverlayThreads`.
 Because ROOT I/O is made thread-safe with `ROOT::EnableThreadSafety()`, the
-algorithm also remains safe to run under Gaudi's intra-event multithreading; the
-per-event parallelism composes with it via the shared task arena.
+algorithm also remains safe to run under Gaudi's intra-event multithreading.
 
 The speed-up is largest when reading dominates (many large files, tight time
 windows that keep the merge cheap); when the merge is the bottleneck the gain is
 correspondingly smaller.
+
+### Interplay with the Gaudi scheduler
+
+`OverlayThreads` and the scheduler's `ThreadPoolSize` are not independent: they
+draw from the same pool of threads. `ThreadPoolSvc` sets a process-wide TBB
+`global_control` of `ThreadPoolSize + maxParallelismExtra + 1` and creates the
+task arena into which `AvalancheSchedulerSvc` enqueues every algorithm, and the
+parallel reading runs inside that same arena. This means the machine is never
+oversubscribed, but it also means:
+
+- Gaudi has no way of knowing about the extra parallelism. The scheduler counts
+  algorithms in flight, not threads, so it keeps dispatching other algorithms
+  while `OverlayTiming` is fanned out.
+- `OverlayThreads` bounds the number of background reads in flight, not the
+  number of threads actually available. With `ThreadPoolSize = 1` the arena has
+  two threads, and a large `OverlayThreads` will not buy more than that.
+
+There is currently no way for a functional algorithm to declare its internal
+parallelism to the scheduler (`Asynchronous` is the Boost.Fiber path for
+offloaded work, not this). In practice `OverlayThreads > 1` pays off when
+`ThreadPoolSize` is small -- branching out inside a single event rather than
+running many events concurrently -- and raising both just repartitions the same
+threads. If the extra threads should come on top of the scheduler's pool,
+`AvalancheSchedulerSvc.maxParallelismExtra` raises the TBB limit accordingly.
