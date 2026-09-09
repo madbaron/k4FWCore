@@ -34,6 +34,8 @@ if (NOT EDM4HEP_FOUND)
   find_package(EDM4HEP 0.99 REQUIRED)
 endif()
 find_package(fmt REQUIRED)
+# Used by OverlayTiming to read background files on several threads
+find_package(TBB REQUIRED)
 
 include(cmake/Key4hepConfig.cmake)
 
